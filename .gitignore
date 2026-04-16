@@ -7,3 +7,4 @@ templates/
 comfyui/workflows/
 __pycache__/
 .DS_Store
+push-to-github.sh
