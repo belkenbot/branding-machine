@@ -1,0 +1,227 @@
+##############################################################
+# Acer Nitro V 16 — Personal Branding Machine
+# Ken's personal content factory (TikTok, UGC, LinkedIn/X)
+#
+# Hardware: RTX 5050 (8GB VRAM), Ryzen 7, 16GB DDR5
+# Target:   32GB after upgrade
+#
+# Usage:
+#   docker compose up -d                    # start everything
+#   docker compose up -d comfyui forge      # just GPU + render
+#   docker compose --profile full up -d     # includes ollama
+#
+# GPU Note: ComfyUI gets exclusive GPU access by default.
+#           Ollama shares GPU only when ComfyUI is idle.
+##############################################################
+
+services:
+
+  # ─── ComfyUI: Image + Video Generation ─────────────────
+  comfyui:
+    image: ghcr.io/ai-dock/comfyui:latest
+    container_name: comfyui
+    restart: unless-stopped
+    ports:
+      - "8188:8188"
+    volumes:
+      - comfyui-models:/workspace/ComfyUI/models
+      - comfyui-output:/workspace/ComfyUI/output
+      - comfyui-input:/workspace/ComfyUI/input
+      - ./comfyui/workflows:/workspace/ComfyUI/user/default/workflows
+      - ./face-refs:/workspace/ComfyUI/input/face-refs
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - CLI_ARGS=--lowvram --preview-method auto
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+        limits:
+          memory: 6G
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8188/system_stats"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  # ─── Forge v2: Video Assembly Pipeline ─────────────────
+  forge:
+    build:
+      context: ./forge
+      dockerfile: Dockerfile
+    container_name: forge-pipeline
+    restart: unless-stopped
+    ports:
+      - "8200:8200"
+    volumes:
+      - forge-output:/app/output
+      - forge-staging:/app/staging
+      - comfyui-output:/app/comfyui-output:ro
+      - ./face-refs:/app/face-refs:ro
+      - ./brands:/app/brands:ro
+    environment:
+      - MINIMAX_API_KEY=${MINIMAX_API_KEY}
+      - MINIMAX_GROUP_ID=${MINIMAX_GROUP_ID}
+      - GOOGLE_API_KEY=${GOOGLE_API_KEY}
+      - POSTGRES_URL=postgresql://belken:${POSTGRES_PASSWORD}@postgres:5432/belken
+      - COMFYUI_URL=http://comfyui:8188
+      - OUTPUT_DIR=/app/output
+      - NODE_ENV=production
+    depends_on:
+      comfyui:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+
+  # ─── Remotion: Programmatic Video Editor ───────────────
+  remotion:
+    build:
+      context: ./remotion
+      dockerfile: Dockerfile
+    container_name: remotion-editor
+    restart: unless-stopped
+    ports:
+      - "3100:3000"
+    volumes:
+      - forge-output:/app/public/forge-output:ro
+      - comfyui-output:/app/public/comfyui-output:ro
+      - remotion-output:/app/out
+      - ./brands:/app/public/brands:ro
+      - ./templates:/app/src/templates
+    environment:
+      - REMOTION_CHROME_EXECUTABLE=/usr/bin/chromium
+      - NODE_ENV=production
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+
+  # ─── Postgres: Local Knowledge Store ───────────────────
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: postgres
+    restart: unless-stopped
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./init-db:/docker-entrypoint-initdb.d
+    environment:
+      - POSTGRES_USER=belken
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - POSTGRES_DB=belken
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U belken"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  # ─── n8n: Workflow Automation ──────────────────────────
+  n8n:
+    image: n8nio/n8n:latest
+    container_name: n8n
+    restart: unless-stopped
+    ports:
+      - "5678:5678"
+    volumes:
+      - n8n-data:/home/node/.n8n
+      - forge-output:/data/forge-output:ro
+      - remotion-output:/data/remotion-output:ro
+    environment:
+      - N8N_BASIC_AUTH_ACTIVE=true
+      - N8N_BASIC_AUTH_USER=${N8N_USER:-admin}
+      - N8N_BASIC_AUTH_PASSWORD=${N8N_PASSWORD:-changeme}
+      - GENERIC_TIMEZONE=America/New_York
+      - DB_TYPE=postgresdb
+      - DB_POSTGRESDB_HOST=postgres
+      - DB_POSTGRESDB_PORT=5432
+      - DB_POSTGRESDB_DATABASE=n8n
+      - DB_POSTGRESDB_USER=belken
+      - DB_POSTGRESDB_PASSWORD=${POSTGRES_PASSWORD}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+
+  # ─── Ollama: Local LLM (optional, needs 32GB RAM) ─────
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ollama
+    restart: unless-stopped
+    profiles:
+      - full
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama-models:/root/.ollama
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - OLLAMA_MAX_LOADED_MODELS=1
+      - OLLAMA_NUM_PARALLEL=1
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+        limits:
+          memory: 8G
+
+  # ─── SearXNG: Private Search (for content research) ───
+  searxng:
+    image: searxng/searxng:latest
+    container_name: searxng
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    volumes:
+      - searxng-data:/etc/searxng
+    environment:
+      - SEARXNG_BASE_URL=http://localhost:8080/
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+
+  # ─── Watchtower: Auto-update containers ────────────────
+  watchtower:
+    image: containrrr/watchtower:latest
+    container_name: watchtower
+    restart: unless-stopped
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      - WATCHTOWER_CLEANUP=true
+      - WATCHTOWER_POLL_INTERVAL=86400
+      - WATCHTOWER_INCLUDE_STOPPED=true
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+
+volumes:
+  comfyui-models:
+  comfyui-output:
+  comfyui-input:
+  forge-output:
+  forge-staging:
+  remotion-output:
+  postgres-data:
+  n8n-data:
+  ollama-models:
+  searxng-data:
